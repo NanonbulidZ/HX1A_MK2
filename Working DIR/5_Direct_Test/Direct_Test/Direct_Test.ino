@@ -5,15 +5,32 @@
  * Arduino IDE - install Bluepad32 library
  */
 #include <Bluepad32.h>
-#include "protocol.h"
+#include "hex_protocol.h"
 
-// Direct UART to Pico2 (Serial2: TX=17, RX=16)
+// Direct UART to Pico2 (Serial1: TX=6/D6, RX=7/D7)
 #define UART_BAUD 921600
+
+// Built-in LED on XIAO ESP32 C3 = GPIO8, active LOW
+#define LED_PIN 8
+#define LED_ON LOW
+#define LED_OFF HIGH
 
 GamepadPtr gp = nullptr;
 
 void onConnectedGamepad(GamepadPtr g) { gp = g; Serial.println("GP connected"); }
 void onDisconnectedGamepad(GamepadPtr g) { if (gp == g) gp = nullptr; Serial.println("GP disconnected"); }
+
+// LED patterns: 0=slow (no gamepad), 1=medium (connected idle), 2=fast (active)
+static void update_led() {
+    static uint32_t last = 0;
+    static bool state = false;
+    uint32_t now = millis();
+    uint32_t interval;
+    if (!gp || !gp->isConnected()) interval = 2000;   // slow: 2s
+    else if (abs(gp->axisRY()) > 50 || abs(gp->axisRX()) > 50 || abs(gp->axisX()) > 50 || abs(gp->axisY()) > 50) interval = 200; // fast active
+    else interval = 1000; // medium idle
+    if (now - last >= interval) { last = now; state = !state; digitalWrite(LED_PIN, state ? LED_OFF : LED_ON); }
+}
 
 uint8_t tx_buf[32];
 uint8_t seq = 0;
@@ -24,20 +41,20 @@ void send_velocity(int16_t vx, int16_t vy, int16_t vr, int16_t body_vz, int16_t 
     p.body_vz = body_vz; p.body_rx = body_rx; p.body_ry = body_ry;
     p.flags = flags; p.speed = spd;
     int n = proto_build(tx_buf, PKT_VELOCITY, (uint8_t*)&p, sizeof(p), seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 void send_leg_offsets(const int8_t ox[6], const int8_t oy[6], const int8_t oz[6]) {
     PktLegOffset p;
     memcpy(p.ox, ox, 6); memcpy(p.oy, oy, 6); memcpy(p.oz, oz, 6);
     int n = proto_build(tx_buf, PKT_LEG_OFFSET, (uint8_t*)&p, sizeof(p), seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 void send_mode(uint8_t mode, uint8_t gait) {
     uint8_t m[2] = {mode, gait};
     int n = proto_build(tx_buf, PKT_MODE, m, 2, seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 // Telemetry receive buffer
@@ -45,8 +62,10 @@ uint8_t telem_buf[128];
 int telem_len = 0;
 
 void setup() {
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LED_OFF);
     Serial.begin(115200);
-    Serial2.begin(UART_BAUD, SERIAL_8N1, 16, 17);
+    Serial1.begin(UART_BAUD, SERIAL_8N1, 7, 6);
     BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
     BP32.enableVirtualDevice(false);
     Serial.println("Direct Test ready");
@@ -56,8 +75,8 @@ void loop() {
     BP32.update();
 
     // Read back telemetry from Pico2 and print
-    while (Serial2.available()) {
-        uint8_t b = Serial2.read();
+    while (Serial1.available()) {
+        uint8_t b = Serial1.read();
         if (telem_len < (int)sizeof(telem_buf)) {
             telem_buf[telem_len++] = b;
         } else {
@@ -80,6 +99,7 @@ void loop() {
         }
     }
 
+    update_led();
     if (!gp || !gp->isConnected()) return;
 
     // Same gamepad mapping as Code 1
@@ -107,5 +127,16 @@ void loop() {
     uint8_t spd = constrain(abs(gp->brake() - 512) * 100 / 512, 0, 100);
 
     send_velocity(vx, vy, vr, body_vz, body_rx, body_ry, flags, spd);
+
+    // Heartbeat at ~1Hz
+    static uint32_t last_hb = 0;
+    static uint32_t hb_count = 0;
+    if (millis() - last_hb >= 1000) {
+        last_hb = millis(); hb_count++;
+        Serial.printf("[%lu] ♥ ESP32 OK | gamepad=%s | vx=%d vy=%d vr=%d flags=0x%02X\n",
+                      hb_count, (gp && gp->isConnected()) ? "YES" : "NO",
+                      vx, vy, vr, flags);
+    }
+
     delay(10);
 }

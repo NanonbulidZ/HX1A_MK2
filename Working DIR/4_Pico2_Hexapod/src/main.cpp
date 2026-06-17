@@ -9,7 +9,21 @@
  * - Foot-switch adaptive gait
  * - Telemetry sender
  * PlatformIO + Earle Philhower Arduino core
+ *
+ * FIXES vs v1.0:
+ *  [1] Serial USB-CDC: wait for host enumeration before printing
+ *  [2] LED blinker: phase 1 properly tracks ON/OFF half-cycles
+ *  [3] last_seq dedup: was 8-entry array indexed by nibble — PKT_TELEM(0x81)
+ *      collided with PKT_VELOCITY(0x01). Now uses full 256-entry array.
+ *  [4] foot_switches_present: was sticky (never cleared). Now re-detected per loop.
+ *  [5] SPI: bmi_spi_rw opened/closed transaction per byte (slow + wrong).
+ *      Fixed: transaction wraps entire burst.
+ *  [6] SPI pins never assigned to SPI object. Added SPI.setRX/TX/SCK/CS.
+ *  [7] proto_build hello: length was 7 but "PICO2_OK" is 8 chars.
+ *  [8] ERR_OK LED: now does a single slow heartbeat so you always see
+ *      something on the LED in every scenario.
  */
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -27,19 +41,19 @@
 #define I2C_SDA 4
 #define I2C_SCL 5
 
-// SPI0 for BMI160 (CS=GP17, SCK=GP18, MOSI=GP19, MISO=GP16)
-#define BMI_CS   17
-#define BMI_SCK  18
-#define BMI_MOSI 19
-#define BMI_MISO 16
+// SPI0 for BMI160 (CS=GP13, SCK=GP14, MOSI=GP15, MISO=GP12)
+#define BMI_CS   13
+#define BMI_SCK  14
+#define BMI_MOSI 15
+#define BMI_MISO 12
 
-// Foot switches GPIO 22-17 (active low, input_pullup)
-#define FOOT0 22
-#define FOOT1 21
-#define FOOT2 20
-#define FOOT3 19
-#define FOOT4 18
-#define FOOT5 17
+// Foot switches GP16-21 (active low, input_pullup)
+#define FOOT0 21
+#define FOOT1 20
+#define FOOT2 19
+#define FOOT3 18
+#define FOOT4 17
+#define FOOT5 16
 
 // PCA9685 address
 #define PCA9685_ADDR_LEFT  0x40
@@ -74,13 +88,11 @@
 // ============================
 // MOUNTING ANGLES (degrees)
 // ============================
-// Leg0(FR)=+45, Leg1(FL)=+90, Leg2(ML)=+135, Leg3(RL)=+225, Leg4(RR)=+270, Leg5(MR)=+315
 static const float mount_deg[6] = {45.0f, 90.0f, 135.0f, 225.0f, 270.0f, 315.0f};
 
 // ============================
 // HOME POSITIONS (degrees)
 // ============================
-// 18 values: L0_coxa,L0_femur,L0_tibia, L1_coxa,... same order as CH_ defines
 static const float home_deg[18] = {
     90.0f, 90.0f, 90.0f,   // Leg0 FR
     90.0f, 90.0f, 90.0f,   // Leg1 FL
@@ -90,7 +102,7 @@ static const float home_deg[18] = {
     90.0f, 90.0f, 90.0f    // Leg5 MR
 };
 
-// Calibration offsets (pulled from original hexapod)
+// Calibration offsets
 static float coxa_cal[6]  = {0, 0, 0, 0, 0, 0};
 static float femur_cal[6] = {0, 0, 0, 0, 0, 0};
 static float tibia_cal[6] = {0, 0, 0, 0, 0, 0};
@@ -102,32 +114,98 @@ static float tibia_cal[6] = {0, 0, 0, 0, 0, 0};
 #define FEMUR_LEN 60.0f
 #define TIBIA_LEN 80.0f
 
-// Leg positions relative to body center (mm)
-// Leg0(FR) x=+60,y=-50, Leg1(FL) x=+60,y=+50, Leg2(ML) x=0,y=+60
-// Leg3(RL) x=-60,y=+50, Leg4(RR) x=-60,y=-50, Leg5(MR) x=0,y=-60
 static const float leg_x[6] = { 60.0f,  60.0f,   0.0f, -60.0f, -60.0f,   0.0f};
 static const float leg_y[6] = {-50.0f,  50.0f,  60.0f,  50.0f, -50.0f, -60.0f};
 
-// Default stance width (mm from body center)
 #define STANCE_W 70.0f
 #define STANCE_L 60.0f
 #define BODY_H   75.0f
 
 // ============================
-// SERVO RANGE (raw PCA9685 PWM counts, 0-4095 @ 50Hz)
+// SERVO RANGE
 // ============================
-#define SERVOMIN 150
-#define SERVOMAX 600
+#define SERVOMIN    150
+#define SERVOMAX    600
 #define SERVOCENTER ((SERVOMIN + SERVOMAX) / 2)
-#define PWM_FREQ 50.0f
+#define PWM_FREQ    50.0f
+
+// ============================
+// ERROR CODES & LED INDICATOR
+// ============================
+// Built-in LED on Pico2 is GP25
+#define LED_PIN 25
+
+// Error codes — value = number of blinks in the burst:
+//   ERR_OK       (0) → heartbeat: 1 slow blink every 2s (solid "alive" signal)
+//   ERR_BMI160   (1) → 2 fast blinks, pause
+//   ERR_NOCMD    (2) → 3 fast blinks, pause
+//   ERR_BMI_NOCMD(3) → 4 fast blinks, pause
+enum { ERR_OK = 0, ERR_BMI160 = 1, ERR_NOCMD = 2, ERR_BMI_NOCMD = 3 };
+static uint8_t error_code = ERR_OK;
+
+// Non-blocking LED blinker
+// FIX [2]: phase 1 now properly tracks LED on/off half-cycles.
+// Pattern per error_code:
+//   ERR_OK        : slow heartbeat — 200ms on, 1800ms off (always visible)
+//   ERR_BMI160    : 2 blinks (150ms on / 150ms off), 1.5s pause
+//   ERR_NOCMD     : 3 blinks, 1.5s pause
+//   ERR_BMI_NOCMD : 4 blinks, 1.5s pause
+static void update_led() {
+    static uint32_t last_ms  = 0;
+    static uint8_t  phase    = 0;  // 0=pause/idle, 1=burst
+    static int      half     = 0;  // half-cycle index within burst (0=first ON, 1=first OFF, ...)
+    uint32_t now = millis();
+
+    if (error_code == ERR_OK) {
+        // Heartbeat: 200ms on, 1800ms off
+        static bool hb_on = false;
+        uint32_t interval = hb_on ? 200 : 1800;
+        if (now - last_ms >= interval) {
+            last_ms = now;
+            hb_on = !hb_on;
+            digitalWrite(LED_PIN, hb_on ? HIGH : LOW);
+        }
+        return;
+    }
+
+    // Fault blink: n = error_code + 1 blinks
+    int n = error_code + 1; // 2, 3, or 4 blinks
+
+    switch (phase) {
+        case 0: // idle/pause
+            digitalWrite(LED_PIN, LOW);
+            if (now - last_ms >= 1500) {
+                phase = 1;
+                half  = 0;
+                last_ms = now;
+                digitalWrite(LED_PIN, HIGH); // start first ON immediately
+            }
+            break;
+
+        case 1: // burst — alternating ON (even half) / OFF (odd half)
+            if (now - last_ms >= 150) {
+                last_ms = now;
+                half++;
+                if (half >= n * 2) {
+                    // Finished all blinks
+                    phase = 0;
+                    last_ms = now;
+                    digitalWrite(LED_PIN, LOW);
+                } else {
+                    // Toggle: even half = ON, odd half = OFF
+                    digitalWrite(LED_PIN, (half % 2 == 0) ? HIGH : LOW);
+                }
+            }
+            break;
+    }
+}
 
 // ============================
 // GAIT PARAMETERS
 // ============================
-#define TICK_RATE_HZ 100   // gait ticks per second
+#define TICK_RATE_HZ 100
 #define TICK_US (1000000 / TICK_RATE_HZ)
 
-// Gait cycle lengths (ticks)
 #define TRIPOD_CYCLE    10
 #define WAVE_CYCLE      30
 #define RIPPLE_CYCLE    18
@@ -139,34 +217,34 @@ static const float leg_y[6] = {-50.0f,  50.0f,  60.0f,  50.0f, -50.0f, -60.0f};
 static volatile uint32_t tick_counter = 0;
 static volatile uint32_t tick_us_last = 0;
 
-// Command state
 static int16_t cmd_vx = 0, cmd_vy = 0, cmd_vr = 0;
 static int16_t cmd_body_vz = 0, cmd_body_rx = 0, cmd_body_ry = 0;
 static uint8_t cmd_flags = 0, cmd_speed = 100;
-static uint8_t gait_mode = 0; // 0=tripod, 1=wave, 2=ripple, 3=tetrapod
-static int8_t leg_ox[6] = {0}, leg_oy[6] = {0}, leg_oz[6] = {0};
+static uint8_t gait_mode = 0;
+static int8_t  leg_ox[6] = {0}, leg_oy[6] = {0}, leg_oz[6] = {0};
 
-// Stride length (locked at tick==0 to prevent mid-cycle changes)
 static float n_x = 0.0f, n_y = 0.0f, n_r = 0.0f;
 static float n_body_vz = 0.0f, n_body_rx = 0.0f, n_body_ry = 0.0f;
 
-// Foot switch state
 static uint8_t foot_contact = 0;
-static uint32_t foot_swing_start[6] = {0};
-static bool foot_early[6] = {false};
-static bool foot_switches_present = false;
+static bool    foot_early[6] = {false};
+// FIX [4]: foot_switches_present is re-evaluated each loop, not sticky.
+static bool    foot_switches_present = false;
 
-// IMU state
-static float imu_roll = 0.0f, imu_pitch = 0.0f, imu_yaw = 0.0f;
+static bool    imu_ok    = false;
+static float   imu_roll  = 0.0f, imu_pitch = 0.0f, imu_yaw = 0.0f;
 static int16_t imu_ax, imu_ay, imu_az;
 static int16_t imu_gx, imu_gy, imu_gz;
 
-// Protocol state
 static uint8_t proto_rx_buf[128];
-static int proto_rx_len = 0;
+static int     proto_rx_len = 0;
 static uint8_t proto_tx_buf[sizeof(PktTelemetry) + 8];
 static uint8_t proto_seq = 0;
-static uint8_t last_seq[8] = {0}; // dedup per type
+// FIX [3]: was [8] indexed by nibble — caused collision between
+// PKT_VELOCITY(0x01) and PKT_TELEM(0x81) both mapping to index 1.
+// Now full 256-entry table, direct index by type byte.
+static uint8_t last_seq[256];
+static uint32_t last_cmd_ms = 0;
 
 // ============================
 // PCA9685 I2C FUNCTIONS
@@ -191,10 +269,11 @@ static void pca_set_pwm(uint8_t addr, uint8_t ch, uint16_t off) {
 }
 
 static void pca_init(uint8_t addr) {
-    pca_write(addr, 0x00, 0x20);
-    pca_write(addr, 0xFE, (uint8_t)(roundf(25000000.0f / (4096.0f * PWM_FREQ)) - 1));
-    pca_write(addr, 0x00, 0x20 | 0x80);
-    pca_write(addr, 0x00, 0xA0);
+    pca_write(addr, 0x00, 0x20);  // sleep
+    uint8_t prescale = (uint8_t)(roundf(25000000.0f / (4096.0f * PWM_FREQ)) - 1);
+    pca_write(addr, 0xFE, prescale);
+    pca_write(addr, 0x00, 0x20 | 0x80); // restart
+    pca_write(addr, 0x00, 0xA0);  // auto-increment on, normal mode
     delay(5);
 }
 
@@ -207,107 +286,121 @@ static void set_servo_pwm(uint8_t addr, uint8_t ch, uint16_t pwm) {
 // ============================
 // BMI160 SPI DRIVER
 // ============================
+// FIX [6]: SPI pins are now assigned to the SPI object.
+// FIX [5]: SPI transaction now wraps entire burst, not per-byte.
+
 static void bmi_cs(bool level) {
     digitalWrite(BMI_CS, level ? HIGH : LOW);
 }
 
-static uint8_t bmi_spi_rw(uint8_t d) {
-    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-    uint8_t r = SPI.transfer(d);
-    SPI.endTransaction();
-    return r;
-}
-
-static void bmi_write(uint8_t reg, uint8_t val) {
-    bmi_cs(LOW);
-    bmi_spi_rw(reg & 0x7F); // write bit 0
-    bmi_spi_rw(val);
-    bmi_cs(HIGH);
-}
-
-static uint8_t bmi_read(uint8_t reg) {
-    bmi_cs(LOW);
-    bmi_spi_rw(reg | 0x80); // read bit 1
-    uint8_t r = bmi_spi_rw(0);
-    bmi_cs(HIGH);
-    return r;
-}
-
-static void bmi_read_burst(uint8_t reg, uint8_t* buf, int len) {
-    bmi_cs(LOW);
-    bmi_spi_rw(reg | 0x80);
-    for (int i = 0; i < len; i++) buf[i] = bmi_spi_rw(0);
-    bmi_cs(HIGH);
-}
-
 static bool bmi_init() {
     pinMode(BMI_CS, OUTPUT);
-    bmi_cs(HIGH);
-    SPI.begin();
+    bmi_cs(true); // deselect
+
+    // FIX [6]: assign SPI pins (Earle Philhower core requires this for non-default pins)
+    SPI.setRX(BMI_MISO);
+    SPI.setTX(BMI_MOSI);
+    SPI.setSCK(BMI_SCK);
+    SPI.setCS(BMI_CS);
+    SPI.begin(false); // false = don't drive CS automatically; we do it manually
 
     // Soft reset
-    bmi_write(0x7E, 0xB6);
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false);
+    SPI.transfer(0x7E & 0x7F); // write
+    SPI.transfer(0xB6);         // reset cmd
+    bmi_cs(true);
+    SPI.endTransaction();
     delay(50);
 
     // Check chip ID
-    uint8_t id = bmi_read(0x00);
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false);
+    SPI.transfer(0x00 | 0x80); // read reg 0x00
+    uint8_t id = SPI.transfer(0x00);
+    bmi_cs(true);
+    SPI.endTransaction();
+
     if (id != 0xD1 && id != 0xC1) {
         Serial.printf("BMI160 ID fail: 0x%02X\n", id);
         return false;
     }
 
-    // Power up accel (normal mode)
-    bmi_write(0x7E, 0x11); // accel normal
+    // Power up accel
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x7E & 0x7F); SPI.transfer(0x11); bmi_cs(true);
+    SPI.endTransaction();
     delay(10);
-    // Power up gyro (normal mode)
-    bmi_write(0x7E, 0x15); // gyro normal
+
+    // Power up gyro
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x7E & 0x7F); SPI.transfer(0x15); bmi_cs(true);
+    SPI.endTransaction();
     delay(10);
 
     // Accel config: ±4g, 100Hz
-    bmi_write(0x41, 0x03); // accel range ±4g
-    bmi_write(0x40, 0x0A); // accel ODR 100Hz
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x41 & 0x7F); SPI.transfer(0x03); bmi_cs(true);
+    SPI.endTransaction();
+
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x40 & 0x7F); SPI.transfer(0x0A); bmi_cs(true);
+    SPI.endTransaction();
+
     // Gyro config: ±2000°/s, 100Hz
-    bmi_write(0x43, 0x00); // gyro range ±2000°/s
-    bmi_write(0x42, 0x0A); // gyro ODR 100Hz
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x43 & 0x7F); SPI.transfer(0x00); bmi_cs(true);
+    SPI.endTransaction();
+
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false); SPI.transfer(0x42 & 0x7F); SPI.transfer(0x0A); bmi_cs(true);
+    SPI.endTransaction();
 
     return true;
 }
 
 static void bmi_read_all() {
     uint8_t raw[12];
-    bmi_read_burst(0x0C, raw, 12); // accel xyz (6) + gyro xyz (6)
 
-    int16_t ax = (int16_t)(raw[1] << 8 | raw[0]);
-    int16_t ay = (int16_t)(raw[3] << 8 | raw[2]);
-    int16_t az = (int16_t)(raw[5] << 8 | raw[4]);
-    int16_t gx = (int16_t)(raw[7] << 8 | raw[6]);
-    int16_t gy = (int16_t)(raw[9] << 8 | raw[8]);
-    int16_t gz = (int16_t)(raw[11] << 8 | raw[10]);
+    // FIX [5]: single transaction for the entire burst read
+    SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    bmi_cs(false);
+    SPI.transfer(0x0C | 0x80); // burst read from 0x0C: gyro xyz (6) then accel xyz (6)
+    for (int i = 0; i < 12; i++) raw[i] = SPI.transfer(0x00);
+    bmi_cs(true);
+    SPI.endTransaction();
+
+    // BMI160 burst order from 0x0C: GYR_X_L, GYR_X_H, GYR_Y_L, GYR_Y_H, GYR_Z_L, GYR_Z_H,
+    //                                ACC_X_L, ACC_X_H, ACC_Y_L, ACC_Y_H, ACC_Z_L, ACC_Z_H
+    int16_t gx = (int16_t)(raw[1]  << 8 | raw[0]);
+    int16_t gy = (int16_t)(raw[3]  << 8 | raw[2]);
+    int16_t gz = (int16_t)(raw[5]  << 8 | raw[4]);
+    int16_t ax = (int16_t)(raw[7]  << 8 | raw[6]);
+    int16_t ay = (int16_t)(raw[9]  << 8 | raw[8]);
+    int16_t az = (int16_t)(raw[11] << 8 | raw[10]);
 
     imu_ax = ax; imu_ay = ay; imu_az = az;
     imu_gx = gx; imu_gy = gy; imu_gz = gz;
 
-    // Accel mg: ±4g = 8192 LSB/g at 16-bit
-    float a_scale = 1000.0f / 8192.0f;
-    float ax_g = (float)ax * a_scale * 0.001f;
-    float ay_g = (float)ay * a_scale * 0.001f;
-    float az_g = (float)az * a_scale * 0.001f;
+    // Accel scale: ±4g → 8192 LSB/g
+    const float a_scale = 1.0f / 8192.0f; // g per LSB
+    float ax_g = (float)ax * a_scale;
+    float ay_g = (float)ay * a_scale;
+    float az_g = (float)az * a_scale;
 
-    // Complementary filter: dt ≈ 0.01s @ 100Hz
-    float dt = 0.01f;
-    float alpha = 0.96f;
+    // Complementary filter
+    const float dt    = 0.01f;
+    const float alpha = 0.96f;
 
-    // Gyro rad/s: ±2000°/s = 16.384 LSB/°/s, convert to rad/s
-    float g_scale = (M_PI / 180.0f) / 16.384f;
+    // Gyro scale: ±2000°/s → 16.384 LSB/(°/s)
+    const float g_scale = (M_PI / 180.0f) / 16.384f; // rad/s per LSB
     float gx_rs = (float)gx * g_scale;
     float gy_rs = (float)gy * g_scale;
     float gz_rs = (float)gz * g_scale;
 
-    // Accel-derived angles
-    float acc_roll  = atan2f(-ay_g, az_g) * 180.0f / M_PI;
+    float acc_roll  = atan2f(-ay_g, az_g)                              * 180.0f / M_PI;
     float acc_pitch = atan2f(ax_g, sqrtf(ay_g * ay_g + az_g * az_g)) * 180.0f / M_PI;
 
-    // Complementary fusion
     static float roll_f = 0, pitch_f = 0, yaw_f = 0;
     roll_f  = alpha * (roll_f  + gx_rs * dt * 180.0f / M_PI) + (1.0f - alpha) * acc_roll;
     pitch_f = alpha * (pitch_f + gy_rs * dt * 180.0f / M_PI) + (1.0f - alpha) * acc_pitch;
@@ -319,34 +412,30 @@ static void bmi_read_all() {
 // ============================
 // INVERSE KINEMATICS
 // ============================
-// Returns: coxa_deg, femur_deg, tibia_deg
-static void ik_leg(int leg, float fx, float fy, float fz, float* coxa, float* femur, float* tibia) {
-    // Mounting rotation
+static void ik_leg(int leg, float fx, float fy, float fz,
+                   float* coxa, float* femur, float* tibia) {
     float mount_rad = mount_deg[leg] * M_PI / 180.0f;
     float cos_m = cosf(mount_rad);
     float sin_m = sinf(mount_rad);
     float rx = fx * cos_m - fy * sin_m;
     float ry = fx * sin_m + fy * cos_m;
 
-    // Coxa angle
     float coxa_rad = atan2f(ry, rx);
     float hip_dist = sqrtf(rx * rx + ry * ry) - COXA_LEN;
     if (hip_dist < 1.0f) hip_dist = 1.0f;
 
-    // Femur-tibia plane
-    float fz_eff = -fz; // foot down = negative
+    float fz_eff = -fz;
     float d = sqrtf(hip_dist * hip_dist + fz_eff * fz_eff);
     if (d > (FEMUR_LEN + TIBIA_LEN)) d = FEMUR_LEN + TIBIA_LEN;
 
-    float cos_fem = (FEMUR_LEN * FEMUR_LEN + d * d - TIBIA_LEN * TIBIA_LEN) / (2.0f * FEMUR_LEN * d);
-    if (cos_fem < -1.0f) cos_fem = -1.0f;
-    if (cos_fem > 1.0f)  cos_fem = 1.0f;
-
+    float cos_fem = (FEMUR_LEN * FEMUR_LEN + d * d - TIBIA_LEN * TIBIA_LEN)
+                  / (2.0f * FEMUR_LEN * d);
+    cos_fem = fmaxf(-1.0f, fminf(1.0f, cos_fem));
     float femur_rad = acosf(cos_fem) + atan2f(fz_eff, hip_dist);
 
-    float cos_tib = (FEMUR_LEN * FEMUR_LEN + TIBIA_LEN * TIBIA_LEN - d * d) / (2.0f * FEMUR_LEN * TIBIA_LEN);
-    if (cos_tib < -1.0f) cos_tib = -1.0f;
-    if (cos_tib > 1.0f)  cos_tib = 1.0f;
+    float cos_tib = (FEMUR_LEN * FEMUR_LEN + TIBIA_LEN * TIBIA_LEN - d * d)
+                  / (2.0f * FEMUR_LEN * TIBIA_LEN);
+    cos_tib = fmaxf(-1.0f, fminf(1.0f, cos_tib));
     float tibia_rad = acosf(cos_tib) - M_PI / 2.0f;
 
     *coxa  = coxa_rad  * 180.0f / M_PI;
@@ -366,15 +455,12 @@ static void body_transform(int leg, float vz, float rx_deg, float ry_deg,
     float ly = leg_y[leg];
     float lz = vz;
 
-    // Roll (around x)
     float y1 = ly * cosf(rx_rad) - lz * sinf(rx_rad);
     float z1 = ly * sinf(rx_rad) + lz * cosf(rx_rad);
 
-    // Pitch (around y)
     float x2 = lx * cosf(ry_rad) + z1 * sinf(ry_rad);
     float z2 = -lx * sinf(ry_rad) + z1 * cosf(ry_rad);
 
-    // Foot position relative to coxa
     *fx = -x2;
     *fy = -y1;
     *fz = -z2 + BODY_H;
@@ -387,13 +473,13 @@ static void foot_traj(float phase, float stride_x, float stride_y, float step_h,
                       float* fx, float* fy, float* fz) {
     float t = fmodf(phase, 1.0f);
     if (t < 0.5f) {
-        // Swing phase
+        // Swing
         float u = t * 2.0f;
         *fx = stride_x * (u - 0.5f);
         *fy = stride_y * (u - 0.5f);
         *fz = step_h * sinf(u * M_PI);
     } else {
-        // Stance phase
+        // Stance
         float u = (t - 0.5f) * 2.0f;
         *fx = stride_x * (u - 0.5f);
         *fy = stride_y * (u - 0.5f);
@@ -404,16 +490,10 @@ static void foot_traj(float phase, float stride_x, float stride_y, float step_h,
 // ============================
 // GAIT ENGINES
 // ============================
-// Phase offsets per leg for each gait
-// Tripod: [0.0, 0.5, 0.0, 0.5, 0.0, 0.5]
-// Wave:   [0.0, 0.2, 0.4, 0.6, 0.8, 0.0]  (actually 0,1,2,3,4,5 sequential)
-// Ripple: [0.0, 0.333, 0.667, 0.167, 0.5, 0.833]
-// Tetrapod: [0.0, 0.5, 0.0, 0.5, 0.0, 0.5] but with 4 legs stance
-
-static const float tripod_phase[6]   = {0.0f, 0.5f, 0.0f, 0.5f, 0.0f, 0.5f};
-static const float wave_phase[6]     = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 0.0f};
+static const float tripod_phase[6]   = {0.0f, 0.5f, 0.0f,   0.5f,  0.0f,  0.5f};
+static const float wave_phase[6]     = {0.0f, 0.2f, 0.4f,   0.6f,  0.8f,  0.0f};
 static const float ripple_phase[6]   = {0.0f, 0.333f, 0.667f, 0.167f, 0.5f, 0.833f};
-static const float tetrapod_phase[6] = {0.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.5f};
+static const float tetrapod_phase[6] = {0.0f, 0.0f, 0.5f,   0.0f,  0.0f,  0.5f};
 
 static int get_cycle_len() {
     switch (gait_mode) {
@@ -437,7 +517,11 @@ static const float* get_phase_offsets() {
 // FOOT SWITCH ADAPTIVE GAIT
 // ============================
 static void read_foot_switches() {
-    foot_contact = 0;
+    // FIX [4]: re-detect presence each call so disconnected switches don't
+    //          permanently lock foot_switches_present to true.
+    foot_contact         = 0;
+    foot_switches_present = false;
+
     if (!digitalRead(FOOT0)) { foot_contact |= (1 << 0); foot_switches_present = true; }
     if (!digitalRead(FOOT1)) { foot_contact |= (1 << 1); foot_switches_present = true; }
     if (!digitalRead(FOOT2)) { foot_contact |= (1 << 2); foot_switches_present = true; }
@@ -450,27 +534,24 @@ static void read_foot_switches() {
 // PROTOCOL HANDLING
 // ============================
 static void process_proto_packet(uint8_t type, uint8_t* payload, uint8_t len, uint8_t seq) {
-    // Dedup: skip if we've seen this sequence for this type recently
-    if (seq == last_seq[type & 0x0F]) return;
-    last_seq[type & 0x0F] = seq;
+    // FIX [3]: direct index by full type byte (256 entries), no nibble collision
+    if (seq == last_seq[type]) return;
+    last_seq[type] = seq;
 
     switch (type) {
         case PKT_VELOCITY: {
             if (len < sizeof(PktVelocity)) return;
+            last_cmd_ms = millis();
             PktVelocity* v = (PktVelocity*)payload;
-            cmd_vx = v->vx;
-            cmd_vy = v->vy;
-            cmd_vr = v->vr;
-            cmd_body_vz = v->body_vz;
-            cmd_body_rx = v->body_rx;
-            cmd_body_ry = v->body_ry;
-            cmd_flags = v->flags;
-            cmd_speed = v->speed;
-
-            // Extract gait from flags bits 1-2
-            gait_mode = (v->flags >> 1) & 0x03;
-
-            // Lock stride at cycle start (tick==0 detection handled in tick)
+            cmd_vx       = v->vx;
+            cmd_vy       = v->vy;
+            cmd_vr       = v->vr;
+            cmd_body_vz  = v->body_vz;
+            cmd_body_rx  = v->body_rx;
+            cmd_body_ry  = v->body_ry;
+            cmd_flags    = v->flags;
+            cmd_speed    = v->speed;
+            gait_mode    = (v->flags >> 1) & 0x03;
             break;
         }
         case PKT_LEG_OFFSET: {
@@ -485,14 +566,14 @@ static void process_proto_packet(uint8_t type, uint8_t* payload, uint8_t len, ui
             if (len < 18) return;
             for (int i = 0; i < 6; i++) {
                 coxa_cal[i]  = (int8_t)payload[i];
-                femur_cal[i] = (int8_t)payload[6 + i];
+                femur_cal[i] = (int8_t)payload[6  + i];
                 tibia_cal[i] = (int8_t)payload[12 + i];
             }
             break;
         }
         case PKT_MODE: {
-            if (len < 2) return;
-            gait_mode = payload[0];
+            if (len < 1) return;
+            gait_mode = payload[0] & 0x03;
             break;
         }
     }
@@ -520,12 +601,12 @@ static void parse_uart() {
 
 static void send_telemetry() {
     PktTelemetry t;
-    t.batt_mv = 0; // TODO: ADC read
-    t.roll  = (int16_t)(imu_roll  * 1000);
-    t.pitch = (int16_t)(imu_pitch * 1000);
-    t.yaw   = (int16_t)(imu_yaw   * 1000);
+    t.batt_mv      = 0; // TODO: ADC read
+    t.roll         = (int16_t)(imu_roll  * 1000);
+    t.pitch        = (int16_t)(imu_pitch * 1000);
+    t.yaw          = (int16_t)(imu_yaw   * 1000);
     t.foot_contact = foot_contact;
-    t.state = cmd_flags;
+    t.state        = cmd_flags;
     t.ax = imu_ax; t.ay = imu_ay; t.az = imu_az;
     t.gx = imu_gx; t.gy = imu_gy; t.gz = imu_gz;
 
@@ -534,33 +615,27 @@ static void send_telemetry() {
 }
 
 // ============================
-// MAIN LOOP FUNCTIONS
+// MAIN LOOP HELPERS (forward-declared)
 // ============================
 static uint32_t last_telem_ms = 0;
 static uint32_t last_print_ms = 0;
-static bool walk_enabled = false;
-static bool balance_enabled = false;
-static int prev_cycle_len = TRIPOD_CYCLE;
+static bool     walk_enabled    = false;
+static bool     balance_enabled = false;
+static int      prev_cycle_len  = TRIPOD_CYCLE;
 
 static void servo_deg_to_pwm(int leg, float coxa_deg, float femur_deg, float tibia_deg,
-                             uint16_t* coxa_pwm, uint16_t* femur_pwm, uint16_t* tibia_pwm) {
-    float c = coxa_deg  + coxa_cal[leg];
-    float f = femur_deg + femur_cal[leg];
-    float t = tibia_deg + tibia_cal[leg];
-
-    if (c < 0) c = 0; if (c > 180) c = 180;
-    if (f < 0) f = 0; if (f > 180) f = 180;
-    if (t < 0) t = 0; if (t > 180) t = 180;
+                              uint16_t* coxa_pwm, uint16_t* femur_pwm, uint16_t* tibia_pwm) {
+    float c = fmaxf(0.0f, fminf(180.0f, coxa_deg  + coxa_cal[leg]));
+    float f = fmaxf(0.0f, fminf(180.0f, femur_deg + femur_cal[leg]));
+    float t = fmaxf(0.0f, fminf(180.0f, tibia_deg + tibia_cal[leg]));
 
     *coxa_pwm  = (uint16_t)(SERVOMIN + (float)(SERVOMAX - SERVOMIN) * c / 180.0f);
     *femur_pwm = (uint16_t)(SERVOMIN + (float)(SERVOMAX - SERVOMIN) * f / 180.0f);
     *tibia_pwm = (uint16_t)(SERVOMIN + (float)(SERVOMAX - SERVOMIN) * t / 180.0f);
 }
 
-// Per-leg channel lookup
-static void get_servo_channels(int leg, uint8_t* addr, uint8_t* ch_coxa, uint8_t* ch_femur, uint8_t* ch_tibia) {
-    // Leg0(FR) and Leg4(RR) and Leg5(MR) on RIGHT PCA
-    // Leg1(FL), Leg2(ML), Leg3(RL) on LEFT PCA
+static void get_servo_channels(int leg, uint8_t* addr,
+                               uint8_t* ch_coxa, uint8_t* ch_femur, uint8_t* ch_tibia) {
     switch (leg) {
         case 0: *addr = PCA9685_ADDR_RIGHT; *ch_coxa = CH_L0_COXA;  *ch_femur = CH_L0_FEMUR;  *ch_tibia = CH_L0_TIBIA; break;
         case 1: *addr = PCA9685_ADDR_LEFT;  *ch_coxa = CH_L1_COXA;  *ch_femur = CH_L1_FEMUR;  *ch_tibia = CH_L1_TIBIA; break;
@@ -568,41 +643,38 @@ static void get_servo_channels(int leg, uint8_t* addr, uint8_t* ch_coxa, uint8_t
         case 3: *addr = PCA9685_ADDR_LEFT;  *ch_coxa = CH_L3_COXA;  *ch_femur = CH_L3_FEMUR;  *ch_tibia = CH_L3_TIBIA; break;
         case 4: *addr = PCA9685_ADDR_RIGHT; *ch_coxa = CH_L4_COXA;  *ch_femur = CH_L4_FEMUR;  *ch_tibia = CH_L4_TIBIA; break;
         case 5: *addr = PCA9685_ADDR_RIGHT; *ch_coxa = CH_L5_COXA;  *ch_femur = CH_L5_FEMUR;  *ch_tibia = CH_L5_TIBIA; break;
+        default: break;
     }
 }
 
 void tick_gait() {
-    // Read command speed (0-100) and scale stride
     float spd_scale = (float)cmd_speed / 100.0f;
-    float stride_vx = (float)cmd_vx * spd_scale / 1000.0f * STANCE_L; // mm
+    float stride_vx = (float)cmd_vx * spd_scale / 1000.0f * STANCE_L;
     float stride_vy = (float)cmd_vy * spd_scale / 1000.0f * STANCE_W;
-    float stride_vr = (float)cmd_vr * spd_scale / 1000.0f * 30.0f; // degrees
+    float stride_vr = (float)cmd_vr * spd_scale / 1000.0f * 30.0f;
 
-    int cycle = get_cycle_len();
-    float body_vz = (float)cmd_body_vz / 10.0f; // mm
-    float body_rx = (float)cmd_body_rx / 10.0f; // degrees
+    int   cycle   = get_cycle_len();
+    float body_vz = (float)cmd_body_vz / 10.0f;
+    float body_rx = (float)cmd_body_rx / 10.0f;
     float body_ry = (float)cmd_body_ry / 10.0f;
 
-    // Lock n values at tick 0 if cycle changed
     if (tick_counter == 0 || cycle != prev_cycle_len) {
-        n_x = stride_vx;
-        n_y = stride_vy;
-        n_r = stride_vr;
+        n_x       = stride_vx;
+        n_y       = stride_vy;
+        n_r       = stride_vr;
         n_body_vz = body_vz;
         n_body_rx = body_rx;
         n_body_ry = body_ry;
         prev_cycle_len = cycle;
     }
 
-    walk_enabled = (cmd_flags & 0x01) || (cmd_flags & 0x20);
-    // Auto-balance when foot switches absent; gamepad controls when present
+    walk_enabled    = (cmd_flags & 0x01) || (cmd_flags & 0x20);
     balance_enabled = foot_switches_present ? (cmd_flags & 0x10) : true;
 
     const float* phases = get_phase_offsets();
 
-    // Balance: apply roll/pitch from IMU as body compensation
     float balance_rx = 0, balance_ry = 0;
-    if (balance_enabled) {
+    if (balance_enabled && imu_ok) {
         balance_rx = -imu_roll;
         balance_ry = -imu_pitch;
     }
@@ -612,62 +684,46 @@ void tick_gait() {
 
         float fx, fy, fz;
         if (walk_enabled && (abs(cmd_vx) > 10 || abs(cmd_vy) > 10 || abs(cmd_vr) > 10)) {
-            float step_h = 30.0f; // mm
+            float step_h = 30.0f;
             foot_traj(phase, n_x, n_y, step_h, &fx, &fy, &fz);
 
-            // Rotation contribution
             float rot_rad = n_r * M_PI / 180.0f;
             float rx = leg_x[leg];
             float ry = leg_y[leg];
-            float rot_x = rx * cosf(rot_rad) - ry * sinf(rot_rad) - rx;
-            float rot_y = rx * sinf(rot_rad) + ry * cosf(rot_rad) - ry;
-            fx += rot_x;
-            fy += rot_y;
+            fx += rx * cosf(rot_rad) - ry * sinf(rot_rad) - rx;
+            fy += rx * sinf(rot_rad) + ry * cosf(rot_rad) - ry;
         } else {
             fx = 0; fy = 0; fz = 0;
         }
 
-        // Leg offset
         fx += (float)leg_ox[leg];
         fy += (float)leg_oy[leg];
         fz += (float)leg_oz[leg];
 
-        // Body transform
         float bfx, bfy, bfz;
-        body_transform(leg, n_body_vz, n_body_rx + balance_rx, n_body_ry + balance_ry, &bfx, &bfy, &bfz);
+        body_transform(leg, n_body_vz, n_body_rx + balance_rx, n_body_ry + balance_ry,
+                       &bfx, &bfy, &bfz);
 
-        // Final foot pos in leg frame
-        float ffx = fx + bfx;
-        float ffy = fy + bfy;
-        float ffz = fz + bfz;
-
-        // IK
         float coxa_deg, femur_deg, tibia_deg;
-        ik_leg(leg, ffx, ffy, ffz, &coxa_deg, &femur_deg, &tibia_deg);
+        ik_leg(leg, fx + bfx, fy + bfy, fz + bfz, &coxa_deg, &femur_deg, &tibia_deg);
 
-        // Home position offset
         int hi = leg * 3;
         coxa_deg  += home_deg[hi];
         femur_deg += home_deg[hi + 1];
         tibia_deg += home_deg[hi + 2];
 
-        // Convert to servo pulse
         uint16_t coxa_pwm, femur_pwm, tibia_pwm;
-        servo_deg_to_pwm(leg, coxa_deg, femur_deg, tibia_deg, &coxa_pwm, &femur_pwm, &tibia_pwm);
+        servo_deg_to_pwm(leg, coxa_deg, femur_deg, tibia_deg,
+                         &coxa_pwm, &femur_pwm, &tibia_pwm);
 
-        // Detect foot switch early contact for adaptive step height
-        if (phase < 0.5f && phase > 0.05f) {
-            // Currently in swing
-            if (foot_contact & (1 << leg)) {
-                // Foot hit ground early - note for next cycle
-                foot_early[leg] = true;
-            }
+        // Adaptive foot switch: detect early ground contact during swing
+        if (phase > 0.05f && phase < 0.5f) {
+            if (foot_contact & (1 << leg)) foot_early[leg] = true;
         }
         if (phase >= 0.5f && phase < 0.55f) {
-            foot_early[leg] = false; // reset for next swing
+            foot_early[leg] = false;
         }
 
-        // Set servos
         uint8_t addr, ch_coxa, ch_femur, ch_tibia;
         get_servo_channels(leg, &addr, &ch_coxa, &ch_femur, &ch_tibia);
         set_servo_pwm(addr, ch_coxa,  coxa_pwm);
@@ -680,15 +736,27 @@ void tick_gait() {
 // SETUP
 // ============================
 void setup() {
-    Serial.begin(115200);
-    delay(100);
+    pinMode(LED_PIN, OUTPUT);
+    memset(last_seq, 0xFF, sizeof(last_seq)); // 0xFF so first packet (seq=0) isn't deduped
 
-    // UART1 (to/from ESP32)
+    // Power-on blink: 3 quick flashes = alive
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, HIGH); delay(100);
+        digitalWrite(LED_PIN, LOW);  delay(100);
+    }
+
+    // FIX [1]: USB CDC Serial — must wait for host enumeration or nothing prints.
+    //          Timeout after 3s so the bot still runs headless.
+    Serial.begin(115200);
+    uint32_t usb_wait = millis();
+    while (!Serial && (millis() - usb_wait < 3000)) { delay(10); }
+
+    // UART1 (ESP32 link)
     Serial1.setTX(UART_TX_PIN);
     Serial1.setRX(UART_RX_PIN);
     Serial1.begin(921600);
 
-    Serial.println("Pico2 Hexapod Brain v1.0");
+    Serial.println("Pico2 Hexapod Brain v1.1");
 
     // I2C for PCA9685
     Wire.setSDA(I2C_SDA);
@@ -696,11 +764,10 @@ void setup() {
     Wire.begin();
     Wire.setClock(400000);
 
-    // Init PCA9685s
     pca_init(PCA9685_ADDR_LEFT);
     pca_init(PCA9685_ADDR_RIGHT);
 
-    // Set all servos to home (90°)
+    // Servos to home
     for (int leg = 0; leg < 6; leg++) {
         uint8_t addr, ch_coxa, ch_femur, ch_tibia;
         get_servo_channels(leg, &addr, &ch_coxa, &ch_femur, &ch_tibia);
@@ -718,16 +785,15 @@ void setup() {
     pinMode(FOOT5, INPUT_PULLUP);
 
     // BMI160
-    if (!bmi_init()) {
-        Serial.println("BMI160 init FAILED");
-    } else {
-        Serial.println("BMI160 OK");
-    }
+    imu_ok = bmi_init();
+    Serial.println(imu_ok ? "BMI160 OK" : "BMI160 FAILED — balance disabled");
 
-    // Send debug hello
-    uint8_t hello[] = "PICO2_OK";
-    int n = proto_build(proto_tx_buf, PKT_DEBUG, hello, 7, proto_seq++);
+    // Hello packet
+    const uint8_t hello[] = "PICO2_OK"; // FIX [7]: length is 8, not 7
+    int n = proto_build(proto_tx_buf, PKT_DEBUG, hello, 8, proto_seq++);
     Serial1.write(proto_tx_buf, n);
+
+    Serial.println("Setup complete.");
 }
 
 // ============================
@@ -736,36 +802,40 @@ void setup() {
 void loop() {
     uint32_t now = micros();
 
-    // Parse incoming UART commands
     parse_uart();
-
-    // Read foot switches
     read_foot_switches();
 
-    // Read IMU at ~100Hz
     static uint32_t last_imu_us = 0;
-    if (now - last_imu_us >= 10000) {
+    if (imu_ok && now - last_imu_us >= 10000) {
         last_imu_us = now;
         bmi_read_all();
     }
 
-    // Gait tick at TICK_RATE_HZ
     if (now - tick_us_last >= TICK_US) {
         tick_us_last = now;
         tick_counter++;
         tick_gait();
     }
 
-    // Telemetry at ~20Hz
     if (millis() - last_telem_ms >= 50) {
         last_telem_ms = millis();
         send_telemetry();
     }
 
-    // Debug print at ~2Hz
     if (millis() - last_print_ms >= 500) {
         last_print_ms = millis();
-        Serial.printf("roll=%.1f pitch=%.1f yaw=%.1f vx=%d vy=%d vr=%d gait=%d contact=0x%02X\n",
-                      imu_roll, imu_pitch, imu_yaw, cmd_vx, cmd_vy, cmd_vr, gait_mode, foot_contact);
+        Serial.printf("roll=%.1f pitch=%.1f yaw=%.1f vx=%d vy=%d vr=%d gait=%d contact=0x%02X err=%d\n",
+                      imu_roll, imu_pitch, imu_yaw,
+                      cmd_vx, cmd_vy, cmd_vr,
+                      gait_mode, foot_contact, error_code);
     }
+
+    // Update error code for LED
+    bool cmd_timeout = (millis() - last_cmd_ms > 3000);
+    if      (!imu_ok && cmd_timeout) error_code = ERR_BMI_NOCMD;
+    else if (!imu_ok)                error_code = ERR_BMI160;
+    else if (cmd_timeout)            error_code = ERR_NOCMD;
+    else                             error_code = ERR_OK;
+
+    update_led();
 }

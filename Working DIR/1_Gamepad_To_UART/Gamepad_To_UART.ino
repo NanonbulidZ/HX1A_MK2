@@ -4,9 +4,9 @@
  * Arduino IDE - install Bluepad32 library
  */
 #include <Bluepad32.h>
-#include "protocol.h"
+#include "hex_protocol.h"
 
-// UART to relay ESP (Serial2: TX=17, RX=16)
+// UART to relay ESP (Serial1: TX=6/D6, RX=7/D7)
 #define UART_BAUD 921600
 
 GamepadPtr gp = nullptr;
@@ -23,25 +23,25 @@ void send_velocity(int16_t vx, int16_t vy, int16_t vr, int16_t body_vz, int16_t 
     p.body_vz = body_vz; p.body_rx = body_rx; p.body_ry = body_ry;
     p.flags = flags; p.speed = spd;
     int n = proto_build(tx_buf, PKT_VELOCITY, (uint8_t*)&p, sizeof(p), seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 void send_leg_offsets(const int8_t ox[6], const int8_t oy[6], const int8_t oz[6]) {
     PktLegOffset p;
     memcpy(p.ox, ox, 6); memcpy(p.oy, oy, 6); memcpy(p.oz, oz, 6);
     int n = proto_build(tx_buf, PKT_LEG_OFFSET, (uint8_t*)&p, sizeof(p), seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 void send_mode(uint8_t mode, uint8_t gait) {
     uint8_t m[2] = {mode, gait};
     int n = proto_build(tx_buf, PKT_MODE, m, 2, seq++);
-    Serial2.write(tx_buf, n);
+    Serial1.write(tx_buf, n);
 }
 
 void setup() {
     Serial.begin(115200);
-    Serial2.begin(UART_BAUD, SERIAL_8N1, 16, 17);
+    Serial1.begin(UART_BAUD, SERIAL_8N1, 7, 6);
     BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
     BP32.enableVirtualDevice(false);
     Serial.println("Gamepad→UART ready");
