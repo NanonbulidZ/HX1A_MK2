@@ -138,7 +138,7 @@ void loop() {
     static uint32_t hb_count = 0;
     if (millis() - last_hb >= 1000) {
         last_hb = millis(); hb_count++;
-        bool pico_link = (millis() - telemetry_last_ms < 3000);
+        bool pico_link = telemetry_last_ms > 0 && (millis() - telemetry_last_ms < 3000);
 
         Serial.printf("[%lu] ♥ ESP32 OK | gamepad=%s | pico=%s | vx=%d vy=%d vr=%d\n",
                       hb_count,
