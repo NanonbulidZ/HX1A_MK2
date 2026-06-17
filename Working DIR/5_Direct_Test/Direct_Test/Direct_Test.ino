@@ -60,6 +60,7 @@ void send_mode(uint8_t mode, uint8_t gait) {
 // Telemetry receive buffer
 uint8_t telem_buf[128];
 int telem_len = 0;
+static uint32_t telemetry_last_ms = 0;
 
 void setup() {
     pinMode(LED_PIN, OUTPUT);
@@ -87,12 +88,16 @@ void loop() {
         if (plen > 0) {
             if (type == PKT_TELEM && plen >= (int)sizeof(PktTelemetry)) {
                 PktTelemetry* t = (PktTelemetry*)payload;
-                Serial.printf("TELEM: batt=%d roll=%d pitch=%d contact=0x%02X state=0x%02X\n",
-                              t->batt_mv, t->roll, t->pitch, t->foot_contact, t->state);
+                bool pca_ok  = t->state & 0x40;
+                bool imu_ok  = t->state & 0x80;
+                Serial.printf("TELEM: batt=%d roll=%d pitch=%d contact=0x%02X PCA=%s IMU=%s\n",
+                              t->batt_mv, t->roll, t->pitch, t->foot_contact,
+                              pca_ok ? "OK" : "MISS", imu_ok ? "OK" : "FAIL");
             } else if (type == PKT_DEBUG) {
                 payload[plen] = 0;
                 Serial.printf("DEBUG: %s\n", (char*)payload);
             }
+            telemetry_last_ms = millis();
             telem_len = 0;
         } else if (plen < 0) {
             telem_len = 0;
@@ -133,9 +138,13 @@ void loop() {
     static uint32_t hb_count = 0;
     if (millis() - last_hb >= 1000) {
         last_hb = millis(); hb_count++;
-        Serial.printf("[%lu] ♥ ESP32 OK | gamepad=%s | vx=%d vy=%d vr=%d flags=0x%02X\n",
-                      hb_count, (gp && gp->isConnected()) ? "YES" : "NO",
-                      vx, vy, vr, flags);
+        bool pico_link = (millis() - telemetry_last_ms < 3000);
+
+        Serial.printf("[%lu] ♥ ESP32 OK | gamepad=%s | pico=%s | vx=%d vy=%d vr=%d\n",
+                      hb_count,
+                      (gp && gp->isConnected()) ? "YES" : "NO",
+                      pico_link ? "LINK" : "DOWN",
+                      vx, vy, vr);
     }
 
     delay(10);

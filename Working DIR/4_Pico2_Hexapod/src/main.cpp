@@ -28,6 +28,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <math.h>
+#include <hardware/watchdog.h>
 #include "protocol.h"
 
 // ============================
@@ -58,6 +59,8 @@
 // PCA9685 address
 #define PCA9685_ADDR_LEFT  0x40
 #define PCA9685_ADDR_RIGHT 0x41
+
+#define FIRMVER "0.1.5"
 
 // ============================
 // DUAL PCA9685 - ONE FOR EACH SIDE
@@ -136,11 +139,22 @@ static const float leg_y[6] = {-50.0f,  50.0f,  60.0f,  50.0f, -50.0f, -60.0f};
 #define LED_PIN 25
 
 // Error codes — value = number of blinks in the burst:
-//   ERR_OK       (0) → heartbeat: 1 slow blink every 2s (solid "alive" signal)
-//   ERR_BMI160   (1) → 2 fast blinks, pause
-//   ERR_NOCMD    (2) → 3 fast blinks, pause
-//   ERR_BMI_NOCMD(3) → 4 fast blinks, pause
-enum { ERR_OK = 0, ERR_BMI160 = 1, ERR_NOCMD = 2, ERR_BMI_NOCMD = 3 };
+//   ERR_OK         (0) → heartbeat: slow pulse every 2s (solid "alive" signal)
+//   ERR_BMI160     (1) → 2 fast blinks, pause
+//   ERR_NOCMD      (2) → 3 fast blinks, pause
+//   ERR_BMI_NOCMD  (3) → 4 fast blinks, pause
+//   ERR_PCA        (4) → 5 fast blinks, pause   — one or both PCA9685 missing
+//   ERR_PCA_BMI    (5) → 6 fast blinks, pause   — PCA9685 missing AND BMI160 failed
+// FIX [11]: dedicated codes so "servo driver not found" is distinguishable
+// at a glance from an IMU fault or a comms timeout.
+enum {
+    ERR_OK        = 0,
+    ERR_BMI160    = 1,
+    ERR_NOCMD     = 2,
+    ERR_BMI_NOCMD = 3,
+    ERR_PCA       = 4,
+    ERR_PCA_BMI   = 5
+};
 static uint8_t error_code = ERR_OK;
 
 // Non-blocking LED blinker
@@ -201,8 +215,23 @@ static void update_led() {
 }
 
 // ============================
-// GAIT PARAMETERS
+// WATCHDOG
 // ============================
+// FIX [12]: Hardware watchdog as a last-resort safety net. Pico SDK watchdog
+// reboots the chip if watchdog_update() isn't called within WATCHDOG_MS —
+// catches any future hang (I2C, SPI, bad loop logic) that would otherwise
+// leave the bot frozen mid-stride with no recovery.
+#define WATCHDOG_MS 2000
+
+static void watchdog_setup() {
+    watchdog_enable(WATCHDOG_MS, true); // true = pause during debug breakpoints
+}
+
+static inline void watchdog_pet() {
+    watchdog_update(); // SDK call: resets the countdown
+}
+
+
 #define TICK_RATE_HZ 100
 #define TICK_US (1000000 / TICK_RATE_HZ)
 
@@ -249,14 +278,25 @@ static uint32_t last_cmd_ms = 0;
 // ============================
 // PCA9685 I2C FUNCTIONS
 // ============================
-static void pca_write(uint8_t addr, uint8_t reg, uint8_t val) {
+// FIX [9]: pca_write/pca_set_pwm now check Wire.endTransmission()'s return
+// code. A missing/NACKing PCA9685 used to hang or silently fail; now it's
+// detected and reported instead of bringing the whole board down.
+// FIX [10]: I2C bus timeout configured in setup() (Wire.setTimeout) so a
+// disconnected/floating PCA9685 can't stall the bus forever.
+
+// Per-PCA "is this chip actually responding" flag, set during pca_init().
+static bool pca_left_ok  = false;
+static bool pca_right_ok = false;
+
+static bool pca_write(uint8_t addr, uint8_t reg, uint8_t val) {
     Wire.beginTransmission(addr);
     Wire.write(reg);
     Wire.write(val);
-    Wire.endTransmission();
+    uint8_t err = Wire.endTransmission();
+    return err == 0; // 0 = success (ACK received)
 }
 
-static void pca_set_pwm(uint8_t addr, uint8_t ch, uint16_t off) {
+static bool pca_set_pwm(uint8_t addr, uint8_t ch, uint16_t off) {
     if (off > 4095) off = 4095;
     uint8_t reg = 0x06 + ch * 4;
     Wire.beginTransmission(addr);
@@ -265,19 +305,30 @@ static void pca_set_pwm(uint8_t addr, uint8_t ch, uint16_t off) {
     Wire.write(0);
     Wire.write(off & 0xFF);
     Wire.write(off >> 8);
-    Wire.endTransmission();
+    uint8_t err = Wire.endTransmission();
+    return err == 0;
 }
 
-static void pca_init(uint8_t addr) {
-    pca_write(addr, 0x00, 0x20);  // sleep
+// Returns true if the chip ACKed every init write (i.e. it's actually present).
+static bool pca_init(uint8_t addr) {
+    bool ok = true;
+    ok &= pca_write(addr, 0x00, 0x20);  // sleep
     uint8_t prescale = (uint8_t)(roundf(25000000.0f / (4096.0f * PWM_FREQ)) - 1);
-    pca_write(addr, 0xFE, prescale);
-    pca_write(addr, 0x00, 0x20 | 0x80); // restart
-    pca_write(addr, 0x00, 0xA0);  // auto-increment on, normal mode
+    ok &= pca_write(addr, 0xFE, prescale);
+    ok &= pca_write(addr, 0x00, 0x20 | 0x80); // restart
+    ok &= pca_write(addr, 0x00, 0xA0);  // auto-increment on, normal mode
     delay(5);
+    return ok;
 }
 
+// FIX [9]: set_servo_pwm now silently no-ops (instead of hanging/blocking)
+// if the relevant PCA9685 was never detected — keeps tick_gait() running
+// even with hardware unplugged.
 static void set_servo_pwm(uint8_t addr, uint8_t ch, uint16_t pwm) {
+    if ((addr == PCA9685_ADDR_LEFT  && !pca_left_ok) ||
+        (addr == PCA9685_ADDR_RIGHT && !pca_right_ok)) {
+        return; // chip not present — skip the I2C call entirely
+    }
     if (pwm < SERVOMIN) pwm = SERVOMIN;
     if (pwm > SERVOMAX) pwm = SERVOMAX;
     pca_set_pwm(addr, ch, pwm);
@@ -606,7 +657,9 @@ static void send_telemetry() {
     t.pitch        = (int16_t)(imu_pitch * 1000);
     t.yaw          = (int16_t)(imu_yaw   * 1000);
     t.foot_contact = foot_contact;
-    t.state        = cmd_flags;
+    t.state = cmd_flags;
+    t.state |= (pca_left_ok && pca_right_ok) ? 0x40 : 0;
+    t.state |= imu_ok ? 0x80 : 0;
     t.ax = imu_ax; t.ay = imu_ay; t.az = imu_az;
     t.gx = imu_gx; t.gy = imu_gy; t.gz = imu_gz;
 
@@ -748,26 +801,43 @@ void setup() {
     // FIX [1]: USB CDC Serial — must wait for host enumeration or nothing prints.
     //          Timeout after 3s so the bot still runs headless.
     Serial.begin(115200);
-    uint32_t usb_wait = millis();
-    while (!Serial && (millis() - usb_wait < 3000)) { delay(10); }
-
+    delay(2000);
+    for (int i = 0; i < 10; i++) {
+        Serial.println("I'M ALIVE");
+        delay(500);
+    }
+    Serial.println("========== Firmware Version ");
+    Serial.print(FIRMVER);
+    Serial.print(" M.O.D. MK2 ==========");
     // UART1 (ESP32 link)
     Serial1.setTX(UART_TX_PIN);
     Serial1.setRX(UART_RX_PIN);
     Serial1.begin(921600);
 
-    Serial.println("Pico2 Hexapod Brain v1.1");
+    Serial.println("Pico2 Hexapod Brain v1.2");
+
+    // FIX [12]: report if we're booting *because* the watchdog fired last time —
+    // huge diagnostic value: tells you "something hung" vs. a normal power cycle.
+    if (watchdog_caused_reboot()) {
+        Serial.println("*** Reboot was caused by watchdog timeout (something hung last run) ***");
+    }
 
     // I2C for PCA9685
     Wire.setSDA(I2C_SDA);
     Wire.setSCL(I2C_SCL);
     Wire.begin();
     Wire.setClock(400000);
+    // FIX [10]: bound how long a stuck/missing I2C device can stall the bus.
+    // Without this, a disconnected PCA9685 can hang Wire.endTransmission()
+    // indefinitely on some cores, freezing setup() before Serial ever prints.
+    Wire.setTimeout(50); // ms
 
-    pca_init(PCA9685_ADDR_LEFT);
-    pca_init(PCA9685_ADDR_RIGHT);
+    pca_left_ok  = pca_init(PCA9685_ADDR_LEFT);
+    pca_right_ok = pca_init(PCA9685_ADDR_RIGHT);
+    if (!pca_left_ok)  Serial.println("PCA9685 LEFT (0x40) not responding — left-side servos disabled");
+    if (!pca_right_ok) Serial.println("PCA9685 RIGHT (0x41) not responding — right-side servos disabled");
 
-    // Servos to home
+    // Servos to home (set_servo_pwm silently skips any chip that isn't present)
     for (int leg = 0; leg < 6; leg++) {
         uint8_t addr, ch_coxa, ch_femur, ch_tibia;
         get_servo_channels(leg, &addr, &ch_coxa, &ch_femur, &ch_tibia);
@@ -794,6 +864,11 @@ void setup() {
     Serial1.write(proto_tx_buf, n);
 
     Serial.println("Setup complete.");
+
+    // FIX [12]: arm the watchdog only after setup finishes, so a slow PCA9685/
+    // BMI160 bring-up (each with its own delay()s) can't itself trip a reboot
+    // loop before the bot even reaches loop().
+    watchdog_setup();
 }
 
 // ============================
@@ -831,11 +906,23 @@ void loop() {
     }
 
     // Update error code for LED
+    // FIX [11]: PCA9685 absence now reported distinctly instead of being
+    // invisible (servos would just silently not move, with no LED clue).
     bool cmd_timeout = (millis() - last_cmd_ms > 3000);
-    if      (!imu_ok && cmd_timeout) error_code = ERR_BMI_NOCMD;
+    bool pca_missing = (!pca_left_ok || !pca_right_ok);
+
+    if      (pca_missing && !imu_ok) error_code = ERR_PCA_BMI;
+    else if (pca_missing)            error_code = ERR_PCA;
+    else if (!imu_ok && cmd_timeout) error_code = ERR_BMI_NOCMD;
     else if (!imu_ok)                error_code = ERR_BMI160;
     else if (cmd_timeout)            error_code = ERR_NOCMD;
     else                             error_code = ERR_OK;
 
     update_led();
+
+    // FIX [12]: hardware watchdog. If anything (an I2C edge case, SPI edge
+    // case, an infinite loop in a future change) ever blocks loop() from
+    // returning, the board reboots itself instead of sitting frozen with
+    // motors at whatever PWM they were last set to.
+    watchdog_pet();
 }
